@@ -88,6 +88,7 @@ module Resque
       end
 
       # Returns the size of the delayed queue schedule
+      # this does not represent the number of items in the queue to be scheduled
       def delayed_queue_schedule_size
         redis.zcard :delayed_queue_schedule
       end
@@ -149,10 +150,22 @@ module Resque
         remove_delayed_job(search)
       end
 
+      def remove_delayed_in_queue(klass, queue, *args)
+        search = encode(job_to_hash_with_queue(queue, klass, args))
+        remove_delayed_job(search)
+      end
+
       # Given an encoded item, enqueue it now
       def enqueue_delayed(klass, *args)
         hash = job_to_hash(klass, args)
         remove_delayed(klass, *args).times do
+          Resque::Scheduler.enqueue_from_config(hash)
+        end
+      end
+
+      def enqueue_delayed_with_queue(klass, queue, *args)
+        hash = job_to_hash_with_queue(queue, klass, args)
+        remove_delayed_in_queue(klass, queue, *args).times do
           Resque::Scheduler.enqueue_from_config(hash)
         end
       end
@@ -178,11 +191,17 @@ module Resque
         raise ArgumentError, 'Please supply a block' unless block_given?
 
         found_jobs = find_delayed_selection(klass) { |args| yield(args) }
-        found_jobs.reduce(0) do |sum, encoded_job|
+        found_jobs.map do |encoded_job|
           decoded_job = decode(encoded_job)
           klass = Util.constantize(decoded_job['class'])
-          sum + enqueue_delayed(klass, *decoded_job['args'])
-        end
+          queue = decoded_job['queue']
+
+          if queue
+            enqueue_delayed_with_queue(klass, queue, *decoded_job['args'])
+          else
+            enqueue_delayed(klass, *decoded_job['args'])
+          end
+        end.sum
       end
 
       # Given a block, find jobs that return true from a block
@@ -271,6 +290,8 @@ module Resque
         { class: klass.to_s, args: args, queue: queue }
       end
 
+      # Removes a job from the queue, but not modify the timestamp schedule. This method
+      # will not effect the output of `delayed_queue_schedule_size`
       def remove_delayed_job(encoded_job)
         return 0 if Resque.inline?
 
@@ -282,6 +303,9 @@ module Resque
             redis.srem("timestamps:#{encoded_job}", key)
           end
         end
+
+        # timestamp key is not removed from the schedule, this is done later
+        # by the scheduler loop
 
         return 0 if replies.nil? || replies.empty?
         replies.each_slice(2).map(&:first).inject(:+)
